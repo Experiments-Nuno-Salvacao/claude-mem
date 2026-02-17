@@ -9,10 +9,12 @@
  */
 
 import { spawn, ChildProcess, execSync } from 'child_process';
+import net from 'net';
 import path from 'path';
 import os from 'os';
 import fs, { existsSync } from 'fs';
 import { logger } from '../../utils/logger.js';
+import { MARKETPLACE_ROOT } from '../../shared/paths.js';
 
 export interface ChromaServerConfig {
   dataDir: string;
@@ -27,6 +29,14 @@ export class ChromaServerManager {
   private starting: boolean = false;
   private ready: boolean = false;
   private startPromise: Promise<boolean> | null = null;
+  private stderrBuffer: string[] = [];
+
+  // Lazy retry state
+  private lastRetryAttempt: number = 0;
+  private failureCount: number = 0;
+  private retryPromise: Promise<boolean> | null = null;
+  private static readonly RETRY_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes base
+  private static readonly MAX_FAILURES_BEFORE_BACKOFF = 3;
 
   private constructor(config: ChromaServerConfig) {
     this.config = config;
@@ -84,10 +94,82 @@ export class ChromaServerManager {
   }
 
   /**
+   * Resolve chroma binary with multi-strategy fallback.
+   * Priority: env override → require.resolve → marketplace .bin → npx fallback
+   */
+  private resolveChromaBinary(): { command: string; resolvedVia: string; spawnCwd?: string } {
+    const isWindows = process.platform === 'win32';
+    const binName = isWindows ? 'chroma.cmd' : 'chroma';
+    const triedPaths: string[] = [];
+
+    // 1. Explicit env var override
+    const envBinary = process.env.CLAUDE_MEM_CHROMA_BINARY;
+    if (envBinary) {
+      if (existsSync(envBinary)) {
+        return { command: envBinary, resolvedVia: 'CLAUDE_MEM_CHROMA_BINARY env var' };
+      }
+      triedPaths.push(`env:${envBinary}`);
+    }
+
+    // 2. require.resolve from chromadb package
+    try {
+      const chromaBinDir = path.dirname(require.resolve('chromadb/package.json'));
+      const projectBin = path.join(chromaBinDir, '..', '.bin', binName);
+      const nestedBin = path.join(chromaBinDir, 'node_modules', '.bin', binName);
+
+      if (existsSync(projectBin)) {
+        return { command: projectBin, resolvedVia: 'require.resolve (project .bin)', spawnCwd: chromaBinDir };
+      }
+      triedPaths.push(projectBin);
+
+      if (existsSync(nestedBin)) {
+        return { command: nestedBin, resolvedVia: 'require.resolve (nested .bin)', spawnCwd: chromaBinDir };
+      }
+      triedPaths.push(nestedBin);
+    } catch {
+      triedPaths.push('require.resolve("chromadb/package.json") failed');
+    }
+
+    // 3. Marketplace installation directory
+    const marketplaceBin = path.join(MARKETPLACE_ROOT, 'node_modules', '.bin', binName);
+    if (existsSync(marketplaceBin)) {
+      return {
+        command: marketplaceBin,
+        resolvedVia: 'marketplace node_modules',
+        spawnCwd: path.join(MARKETPLACE_ROOT, 'node_modules', 'chromadb')
+      };
+    }
+    triedPaths.push(marketplaceBin);
+
+    // 4. npx fallback (with warning)
+    logger.warn('CHROMA_SERVER', 'Falling back to npx for chroma binary', {
+      triedPaths: triedPaths.join(', ')
+    });
+
+    // Try to resolve a cwd for npx so node_modules is findable
+    let spawnCwd: string | undefined;
+    try {
+      spawnCwd = path.dirname(require.resolve('chromadb/package.json'));
+    } catch {
+      // If chromadb isn't resolvable, try marketplace root
+      if (existsSync(path.join(MARKETPLACE_ROOT, 'node_modules', 'chromadb'))) {
+        spawnCwd = path.join(MARKETPLACE_ROOT, 'node_modules', 'chromadb');
+      }
+    }
+
+    return {
+      command: isWindows ? 'npx.cmd' : 'npx',
+      resolvedVia: 'npx fallback',
+      spawnCwd
+    };
+  }
+
+  /**
    * Internal startup path used behind a single shared startPromise lock
    */
   private async startInternal(timeoutMs: number): Promise<boolean> {
     // Check if a server is already running (from previous worker or manual start)
+    let heartbeatOk = false;
     try {
       const response = await fetch(
         `http://${this.config.host}:${this.config.port}/api/v2/heartbeat`,
@@ -102,36 +184,30 @@ export class ChromaServerManager {
         this.starting = false;
         return true;
       }
+      // Non-200 response — something is on this port but it's not Chroma
+      heartbeatOk = false;
     } catch {
-      // No server running, proceed to start one
+      // No server or port not responding at all
+      heartbeatOk = false;
     }
 
-    // Cross-platform: use npx.cmd on Windows
-    const isWindows = process.platform === 'win32';
-
-    // Resolve chroma binary absolutely — npx fails when spawned from cache dirs (#1120)
-    let command: string;
-    let args: string[];
-    try {
-      // chromadb package installs a 'chroma' bin entry
-      const chromaBinDir = path.dirname(require.resolve('chromadb/package.json'));
-      // Check project-level .bin first (most common npm/bun installation layout)
-      const projectBin = path.join(chromaBinDir, '..', '.bin', isWindows ? 'chroma.cmd' : 'chroma');
-      // Fallback: nested node_modules .bin (rare — pnpm or workspace hoisting)
-      const nestedBin = path.join(chromaBinDir, 'node_modules', '.bin', isWindows ? 'chroma.cmd' : 'chroma');
-
-      if (existsSync(projectBin)) {
-        command = projectBin;
-      } else if (existsSync(nestedBin)) {
-        command = nestedBin;
-      } else {
-        // Last resort: npx with explicit cwd
-        command = isWindows ? 'npx.cmd' : 'npx';
+    // Check for port conflicts before attempting to spawn
+    if (!heartbeatOk) {
+      const conflict = await this.checkPortConflict();
+      if (conflict) {
+        logger.error('CHROMA_SERVER', 'Port conflict detected — another service occupies the Chroma port', {
+          port: this.config.port,
+          diagnostic: conflict
+        });
+        this.starting = false;
+        return false;
       }
-    } catch {
-      command = isWindows ? 'npx.cmd' : 'npx';
     }
 
+    // Resolve binary with multi-strategy fallback
+    const { command, resolvedVia, spawnCwd } = this.resolveChromaBinary();
+
+    let args: string[];
     if (command.includes('npx')) {
       args = ['chroma', 'run', '--path', this.config.dataDir, '--host', this.config.host, '--port', String(this.config.port)];
     } else {
@@ -140,19 +216,13 @@ export class ChromaServerManager {
 
     logger.info('CHROMA_SERVER', 'Starting Chroma server', {
       command,
+      resolvedVia,
       args: args.join(' '),
       dataDir: this.config.dataDir
     });
 
     const spawnEnv = this.getSpawnEnv();
-
-    // Resolve cwd for npx fallback — ensures node_modules is findable (#1120)
-    let spawnCwd: string | undefined;
-    try {
-      spawnCwd = path.dirname(require.resolve('chromadb/package.json'));
-    } catch {
-      // If chromadb isn't resolvable, omit cwd and let npx handle it
-    }
+    const isWindows = process.platform === 'win32';
 
     this.serverProcess = spawn(command, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -173,7 +243,12 @@ export class ChromaServerManager {
     this.serverProcess.stderr?.on('data', (data) => {
       const msg = data.toString().trim();
       if (msg) {
-        // Filter out noisy startup messages
+        this.stderrBuffer.push(msg);
+        // Keep buffer bounded (~2KB)
+        while (this.stderrBuffer.join('\n').length > 2048) {
+          this.stderrBuffer.shift();
+        }
+        // Filter out noisy startup messages for debug logging
         if (!msg.includes('Chroma') || msg.includes('error') || msg.includes('Error')) {
           logger.debug('CHROMA_SERVER', msg);
         }
@@ -187,10 +262,19 @@ export class ChromaServerManager {
     });
 
     this.serverProcess.on('exit', (code, signal) => {
-      logger.info('CHROMA_SERVER', 'Server process exited', { code, signal });
+      if (code && code !== 0 && this.stderrBuffer.length > 0) {
+        logger.error('CHROMA_SERVER', 'Server process exited with errors', {
+          code,
+          signal,
+          stderr: this.stderrBuffer.join('\n')
+        });
+      } else {
+        logger.info('CHROMA_SERVER', 'Server process exited', { code, signal });
+      }
       this.ready = false;
       this.starting = false;
       this.serverProcess = null;
+      this.stderrBuffer = [];
     });
 
     return this.waitForReady(timeoutMs);
@@ -236,11 +320,75 @@ export class ChromaServerManager {
     }
 
     this.starting = false;
+    const processAlive = this.serverProcess !== null && !this.serverProcess.killed;
     logger.error('CHROMA_SERVER', 'Server failed to start within timeout', {
       timeoutMs,
-      elapsedMs: Date.now() - startTime
+      elapsedMs: Date.now() - startTime,
+      processAlive,
+      stderr: this.stderrBuffer.length > 0 ? this.stderrBuffer.join('\n') : '(no stderr captured)'
     });
     return false;
+  }
+
+  /**
+   * Detect if the configured port is occupied by a non-Chroma service.
+   * Returns a diagnostic string if conflict detected, or null if port is free.
+   */
+  private async checkPortConflict(): Promise<string | null> {
+    const { host, port } = this.config;
+
+    // Try HTTP heartbeat — if we get a response that isn't Chroma, it's a conflict
+    try {
+      const response = await fetch(
+        `http://${host}:${port}/api/v2/heartbeat`,
+        { signal: AbortSignal.timeout(2000) }
+      );
+      if (!response.ok) {
+        // Port responds to HTTP but not as Chroma
+        return this.buildConflictDiagnostic(port, `HTTP service on port ${port} returned status ${response.status} (not Chroma)`);
+      }
+      // If OK, it IS a Chroma server — not a conflict (caller handles reuse)
+      return null;
+    } catch {
+      // Fetch failed — could be port free, or non-HTTP service
+    }
+
+    // Raw TCP connect to distinguish "port free" from "non-HTTP service"
+    const portInUse = await new Promise<boolean>((resolve) => {
+      const sock = net.createConnection({ host, port }, () => {
+        sock.destroy();
+        resolve(true);
+      });
+      sock.on('error', () => resolve(false));
+      sock.setTimeout(2000, () => {
+        sock.destroy();
+        resolve(false);
+      });
+    });
+
+    if (portInUse) {
+      return this.buildConflictDiagnostic(port, `Non-HTTP service detected on port ${port}`);
+    }
+
+    return null; // Port is free
+  }
+
+  /**
+   * Build diagnostic string for port conflicts, including process info on Linux.
+   */
+  private buildConflictDiagnostic(port: number, base: string): string {
+    let processInfo = '';
+    if (process.platform === 'linux') {
+      try {
+        processInfo = execSync(`ss -tlnp 'sport = :${port}' 2>/dev/null || true`, {
+          encoding: 'utf8',
+          timeout: 3000
+        }).trim();
+      } catch {
+        // Best-effort diagnostics
+      }
+    }
+    return processInfo ? `${base}\n${processInfo}` : base;
   }
 
   /**
@@ -271,6 +419,97 @@ export class ChromaServerManager {
   }
 
   /**
+   * Attempt to restart the Chroma server on demand.
+   * Used for lazy reconnection when vector search is requested but server is down.
+   * Enforces cooldown (5min base, exponential after 3 failures, max ~30min).
+   */
+  async retryStart(timeoutMs: number = 30000): Promise<boolean> {
+    if (this.retryPromise) {
+      logger.debug('CHROMA_SERVER', 'Awaiting existing lazy reconnect attempt');
+      return this.retryPromise;
+    }
+
+    this.retryPromise = this.retryStartInternal(timeoutMs);
+
+    try {
+      return await this.retryPromise;
+    } finally {
+      this.retryPromise = null;
+    }
+  }
+
+  private async retryStartInternal(timeoutMs: number): Promise<boolean> {
+    // Already ready — no-op
+    if (this.ready) {
+      return true;
+    }
+
+    // Check if an externally-started server appeared
+    if (await this.isServerReachable()) {
+      logger.info('CHROMA_SERVER', 'Externally started server detected during retry');
+      this.failureCount = 0;
+      this.lastRetryAttempt = 0;
+      return true;
+    }
+
+    // Enforce cooldown
+    const now = Date.now();
+    let cooldown = ChromaServerManager.RETRY_COOLDOWN_MS;
+    if (this.failureCount >= ChromaServerManager.MAX_FAILURES_BEFORE_BACKOFF) {
+      // Exponential backoff: 5min * 2^(failures-3), capped at ~30min
+      const backoffMultiplier = Math.min(
+        Math.pow(2, this.failureCount - ChromaServerManager.MAX_FAILURES_BEFORE_BACKOFF),
+        6 // Cap at 6x = 30min
+      );
+      cooldown = ChromaServerManager.RETRY_COOLDOWN_MS * backoffMultiplier;
+    }
+
+    const elapsed = now - this.lastRetryAttempt;
+    if (this.lastRetryAttempt > 0 && elapsed < cooldown) {
+      logger.debug('CHROMA_SERVER', 'Retry cooldown active', {
+        cooldownMs: cooldown,
+        remainingMs: cooldown - elapsed,
+        failureCount: this.failureCount
+      });
+      return false;
+    }
+
+    this.lastRetryAttempt = now;
+    logger.info('CHROMA_SERVER', 'Attempting lazy reconnect', {
+      failureCount: this.failureCount,
+      cooldownMs: cooldown
+    });
+
+    // Stop existing process if any
+    if (this.serverProcess) {
+      await this.stopWithOptions({ resetRetryState: false });
+    }
+
+    // Reset state for fresh start
+    this.ready = false;
+    this.starting = false;
+    this.startPromise = null;
+
+    const success = await this.start(timeoutMs);
+
+    if (success) {
+      this.failureCount = 0;
+      this.lastRetryAttempt = 0;
+      logger.info('CHROMA_SERVER', 'Lazy reconnect succeeded');
+    } else {
+      this.failureCount++;
+      logger.warn('CHROMA_SERVER', 'Lazy reconnect failed', {
+        failureCount: this.failureCount,
+        nextCooldownMs: this.failureCount >= ChromaServerManager.MAX_FAILURES_BEFORE_BACKOFF
+          ? ChromaServerManager.RETRY_COOLDOWN_MS * Math.min(Math.pow(2, this.failureCount - ChromaServerManager.MAX_FAILURES_BEFORE_BACKOFF), 6)
+          : ChromaServerManager.RETRY_COOLDOWN_MS
+      });
+    }
+
+    return success;
+  }
+
+  /**
    * Get the server URL for client connections
    */
   getUrl(): string {
@@ -289,6 +528,10 @@ export class ChromaServerManager {
    * Gracefully terminates the server process
    */
   async stop(): Promise<void> {
+    return this.stopWithOptions();
+  }
+
+  private async stopWithOptions(options?: { resetRetryState?: boolean }): Promise<void> {
     if (!this.serverProcess) {
       logger.debug('CHROMA_SERVER', 'No server process to stop');
       return;
@@ -305,6 +548,12 @@ export class ChromaServerManager {
         this.ready = false;
         this.starting = false;
         this.startPromise = null;
+        this.retryPromise = null;
+        this.stderrBuffer = [];
+        if (options?.resetRetryState !== false) {
+          this.failureCount = 0;
+          this.lastRetryAttempt = 0;
+        }
         logger.info('CHROMA_SERVER', 'Server stopped', { pid });
         resolve();
       };
